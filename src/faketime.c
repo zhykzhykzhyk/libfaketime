@@ -1,7 +1,7 @@
 /*
  *  libfaketime wrapper command
  *
- *  This file is part of libfaketime, version 0.9.12
+ *  This file is part of libfaketime, version 0.9.13
  *
  *  libfaketime is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License v2 as published by the
@@ -38,7 +38,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -49,7 +52,13 @@
 #include "android_compat.h"
 #include "faketime_common.h"
 
-const char version[] = "0.9.12";
+#if defined(__SIZEOF_INT128__)
+typedef __int128 faketime_wrapper_wide_t;
+#else
+typedef int64_t faketime_wrapper_wide_t;
+#endif
+
+static const char version[] = "0.9.13";
 
 #if (defined __APPLE__) || (defined __sun)
 static const char *date_cmd = "gdate";
@@ -60,10 +69,59 @@ static const char *date_cmd = "date";
 #define PATH_BUFSIZE 4096
 
 /* semaphore and shared memory names */
-char sem_name[PATH_BUFSIZE] = {0}, shm_name[PATH_BUFSIZE] = {0};
+static char sem_name[PATH_BUFSIZE] = {0}, shm_name[PATH_BUFSIZE] = {0};
 static ft_sem_t wrapper_sem;
 
-void usage(const char *name)
+static void set_env_or_exit(const char *name, const char *value)
+{
+  if (setenv(name, value, true) == -1)
+  {
+    perror("faketime: setenv");
+    exit(EXIT_FAILURE);
+  }
+}
+
+static void clear_date_helper_preload(void)
+{
+  if (unsetenv("LD_PRELOAD") == -1 ||
+      unsetenv("DYLD_INSERT_LIBRARIES") == -1 ||
+      unsetenv("DYLD_FORCE_FLAT_NAMESPACE") == -1)
+  {
+    perror("faketime: clearing date helper preload environment");
+    _exit(EXIT_FAILURE);
+  }
+}
+
+static pid_t wait_for_child(pid_t pid, int *status)
+{
+  pid_t waited;
+
+  do
+  {
+    waited = waitpid(pid, status, 0);
+  }
+  while (waited == -1 && errno == EINTR);
+  return waited;
+}
+
+static bool parse_date_seconds(const char *value, long *result)
+{
+  char *end;
+
+  errno = 0;
+  *result = strtol(value, &end, 10);
+  if (value == end || errno == ERANGE)
+  {
+    return false;
+  }
+  while (isspace((unsigned char)*end))
+  {
+    end++;
+  }
+  return *end == '\0';
+}
+
+static void usage(const char *name)
 {
   printf("\n"
   "Usage: %s [switches] <timestamp> <program with arguments>\n"
@@ -98,7 +156,7 @@ void usage(const char *name)
 }
 
 /** Clean up shared objects */
-static void cleanup_shobjs()
+static void cleanup_shobjs(void)
 {
   if (-1 == ft_sem_unlink(&wrapper_sem))
   {
@@ -135,6 +193,11 @@ int main (int argc, char **argv)
     }
     if (0 == strcmp(argv[curr_opt], "-p"))
     {
+      if (curr_opt + 1 >= argc)
+      {
+        fprintf(stderr, "faketime: -p requires a further argument\n");
+        exit(EXIT_FAILURE);
+      }
       fake_pid = true;
       pid_val = argv[curr_opt + 1];
       curr_opt += 2;
@@ -151,14 +214,14 @@ int main (int argc, char **argv)
     }
     else if (0 == strcmp(argv[curr_opt], "--exclude-monotonic"))
     {
-      setenv("FAKETIME_DONT_FAKE_MONOTONIC", "1", true);
+      set_env_or_exit("FAKETIME_DONT_FAKE_MONOTONIC", "1");
       curr_opt++;
       continue;
     }
 #ifndef FAKE_STATELESS
     else if (0 == strcmp(argv[curr_opt], "--disable-shm"))
     {
-      setenv("FAKETIME_DISABLE_SHM", "1", true);
+      set_env_or_exit("FAKETIME_DISABLE_SHM", "1");
       curr_opt++;
       continue;
     }
@@ -166,10 +229,9 @@ int main (int argc, char **argv)
     else if (0 == strcmp(argv[curr_opt], "--date-prog"))
     {
       curr_opt++;
-      if (curr_opt > argc) {
-        // At best this avoids a segfault reading beyond the argv[]
-        // Realistically there would be other args (e.g. program to call)
+      if (curr_opt >= argc) {
         fprintf(stderr, "faketime: --date-prog requires a further argument\n");
+        exit(EXIT_FAILURE);
       } else {
         date_cmd = argv[curr_opt];
         curr_opt++;
@@ -210,48 +272,124 @@ int main (int argc, char **argv)
   {
     // TODO get seconds
     int pfds[2];
-    (void) (pipe(pfds) + 1);
+    if (pipe(pfds) == -1)
+    {
+      perror("faketime: pipe");
+      exit(EXIT_FAILURE);
+    }
     int ret = EXIT_SUCCESS;
 
-    if (0 == (child_pid = fork()))
+    child_pid = fork();
+    if (child_pid == 0)
     {
       close(1);       /* close normal stdout */
-      (void) (dup(pfds[1]) + 1);   /* make stdout same as pfds[1] */
+      if (dup2(pfds[1], STDOUT_FILENO) == -1)
+      {
+        perror("faketime: dup2");
+        _exit(EXIT_FAILURE);
+      }
+      close(pfds[1]);
       close(pfds[0]); /* we don't need this */
+      clear_date_helper_preload();
       // fprintf(stderr, "faketime: using --date-prog: %s\n", date_cmd);
       if (EXIT_SUCCESS != execlp(date_cmd, date_cmd, "-d", argv[curr_opt], "+%s",(char *) NULL))
       {
         perror("faketime: Running (g)date failed");
-        exit(EXIT_FAILURE);
+        _exit(EXIT_FAILURE);
       }
     }
-    else
+    else if (child_pid > 0)
     {
       char buf[256] = {0}; /* e will have way less than 256 digits */
+      int child_status;
+      pid_t waited;
       close(pfds[1]);   /* we won't write to this */
-      (void) (read(pfds[0], buf, 256) + 1);
-      waitpid(child_pid, &ret, 0);
-      if (ret != EXIT_SUCCESS)
+      size_t bytes_read = 0;
+      bool output_overflow = false;
+      for (;;)
+      {
+        char byte;
+        ssize_t result = read(pfds[0], &byte, sizeof(byte));
+        if (result == 0)
+        {
+          break;
+        }
+        if (result == -1)
+        {
+          if (errno == EINTR)
+          {
+            continue;
+          }
+          perror("faketime: read");
+          close(pfds[0]);
+          exit(EXIT_FAILURE);
+        }
+        if (bytes_read < sizeof(buf) - 1)
+        {
+          buf[bytes_read++] = byte;
+        }
+        else
+        {
+          output_overflow = true;
+        }
+      }
+      buf[bytes_read] = '\0';
+      waited = wait_for_child(child_pid, &child_status);
+      close(pfds[0]);
+      if (output_overflow || waited == -1 || !WIFEXITED(child_status) ||
+          WEXITSTATUS(child_status) != EXIT_SUCCESS)
       {
         printf("Error: Timestamp to fake not recognized, please re-try with a "
                "different timestamp.\n");
         exit(EXIT_FAILURE);
       }
-      offset = atol(buf) - time(NULL);
+      long date_seconds;
+      faketime_wrapper_wide_t offset_wide;
+      if (!parse_date_seconds(buf, &date_seconds))
+      {
+        fprintf(stderr, "faketime: date program returned an invalid timestamp\n");
+        exit(EXIT_FAILURE);
+      }
+      offset_wide = (faketime_wrapper_wide_t)date_seconds -
+        (faketime_wrapper_wide_t)time(NULL);
+      if (offset_wide < (faketime_wrapper_wide_t)LONG_MIN ||
+          offset_wide > (faketime_wrapper_wide_t)LONG_MAX)
+      {
+        fprintf(stderr, "faketime: date timestamp is outside the supported range\n");
+        exit(EXIT_FAILURE);
+      }
+      offset = (long)offset_wide;
       ret = snprintf(buf, sizeof(buf), "%s%ld", (offset >= 0)?"+":"", offset);
-      setenv("FAKETIME", buf, true);
-      close(pfds[0]); /* finished reading */
+      if (ret < 0 || (size_t)ret >= sizeof(buf))
+      {
+        fprintf(stderr, "faketime: generated FAKETIME value is too long\n");
+        exit(EXIT_FAILURE);
+      }
+      set_env_or_exit("FAKETIME", buf);
+    }
+    else
+    {
+      perror("faketime: fork");
+      close(pfds[0]);
+      close(pfds[1]);
+      exit(EXIT_FAILURE);
     }
   }
   else
   {
     /* simply pass format string along */
-    setenv("FAKETIME", argv[curr_opt], true);
+    set_env_or_exit("FAKETIME", argv[curr_opt]);
   }
   if (fake_pid)
-    setenv("FAKETIME_FAKEPID", pid_val, true);
+  {
+    set_env_or_exit("FAKETIME_FAKEPID", pid_val);
+  }
   int keepalive_fds[2];
-  (void) (pipe(keepalive_fds) + 1);
+  if (pipe(keepalive_fds) == -1)
+  {
+    perror("faketime: pipe");
+    exit(EXIT_FAILURE);
+  }
 
   /* we just consumed the timestamp option */
   curr_opt++;
@@ -259,6 +397,7 @@ int main (int argc, char **argv)
   {
     /* create lock and shared memory */
     int shm_fd;
+    int name_length;
     struct ft_shared_s *ft_shared;
     char shared_objs[PATH_BUFSIZE * 2 + 1];
 
@@ -269,8 +408,18 @@ int main (int argc, char **argv)
      * sizeof(long) always >= sizeof(int), this works on all platforms without
      * the need for crazy #ifdefs.
      */
-    snprintf(sem_name, PATH_BUFSIZE -1 ,"/faketime_sem_%ld", (long)getpid());
-    snprintf(shm_name, PATH_BUFSIZE -1 ,"/faketime_shm_%ld", (long)getpid());
+    name_length = snprintf(sem_name, sizeof(sem_name), "/faketime_sem_%ld", (long)getpid());
+    if (name_length < 0 || (size_t)name_length >= sizeof(sem_name))
+    {
+      fprintf(stderr, "faketime: failed to format semaphore name\n");
+      exit(EXIT_FAILURE);
+    }
+    name_length = snprintf(shm_name, sizeof(shm_name), "/faketime_shm_%ld", (long)getpid());
+    if (name_length < 0 || (size_t)name_length >= sizeof(shm_name))
+    {
+      fprintf(stderr, "faketime: failed to format shared-state names\n");
+      exit(EXIT_FAILURE);
+    }
 
     if (-1 == ft_sem_create(sem_name, &wrapper_sem))
     {
@@ -291,6 +440,7 @@ int main (int argc, char **argv)
     if (-1 == ftruncate(shm_fd, sizeof(struct ft_shared_s)))
     {
       perror("faketime: ftruncate");
+      close(shm_fd);
       cleanup_shobjs();
       exit(EXIT_FAILURE);
     }
@@ -300,6 +450,13 @@ int main (int argc, char **argv)
                         MAP_SHARED, shm_fd, 0)))
     {
       perror("faketime: mmap");
+      close(shm_fd);
+      cleanup_shobjs();
+      exit(EXIT_FAILURE);
+    }
+    if (close(shm_fd) == -1)
+    {
+      perror("faketime: close");
       cleanup_shobjs();
       exit(EXIT_FAILURE);
     }
@@ -312,6 +469,9 @@ int main (int argc, char **argv)
     }
 
     /* init elapsed time ticks to zero */
+    ft_shared->magic = FT_SHARED_MAGIC;
+    ft_shared->version = FT_SHARED_VERSION;
+    ft_shared->size = sizeof(struct ft_shared_s);
     ft_shared->ticks = 0;
     ft_shared->file_idx = 0;
     ft_shared->start_time_real.sec = 0;
@@ -339,8 +499,14 @@ int main (int argc, char **argv)
       exit(EXIT_FAILURE);
     }
 
-    snprintf(shared_objs, sizeof(shared_objs), "%s %s", sem_name, shm_name);
-    setenv("FAKETIME_SHARED", shared_objs, true);
+    if (snprintf(shared_objs, sizeof(shared_objs), "%s %s", sem_name, shm_name) < 0 ||
+        strlen(sem_name) + strlen(shm_name) + 1 >= sizeof(shared_objs))
+    {
+      fprintf(stderr, "faketime: failed to format shared-state configuration\n");
+      cleanup_shobjs();
+      exit(EXIT_FAILURE);
+    }
+    set_env_or_exit("FAKETIME_SHARED", shared_objs);
     ft_sem_close(&wrapper_sem);
   }
 
@@ -358,8 +524,8 @@ int main (int argc, char **argv)
     {
       fclose(check);
     }
-    setenv("DYLD_INSERT_LIBRARIES", ftpl_path, true);
-    setenv("DYLD_FORCE_FLAT_NAMESPACE", "1", true);
+    set_env_or_exit("DYLD_INSERT_LIBRARIES", ftpl_path);
+    set_env_or_exit("DYLD_FORCE_FLAT_NAMESPACE", "1");
 #else
     {
       char *ld_preload_new, *ld_preload = getenv("LD_PRELOAD");
@@ -385,39 +551,75 @@ int main (int argc, char **argv)
       }
       len = ((ld_preload)?strlen(ld_preload) + 1: 0) + 1 + strlen(ftpl_path);
       ld_preload_new = malloc(len);
+      if (ld_preload_new == NULL)
+      {
+        perror("faketime: malloc");
+        exit(EXIT_FAILURE);
+      }
       snprintf(ld_preload_new, len ,"%s%s%s", (ld_preload)?ld_preload:"",
               (ld_preload)?":":"", ftpl_path);
-      setenv("LD_PRELOAD", ld_preload_new, true);
+      set_env_or_exit("LD_PRELOAD", ld_preload_new);
       free(ld_preload_new);
     }
 #endif
   }
 
   /* run command and clean up shared objects */
-  if (0 == (child_pid = fork()))
+  child_pid = fork();
+  if (child_pid == 0)
   {
     close(keepalive_fds[0]); /* only parent needs to read this */
     // fprintf(stderr, "faketime: Executing: %s\n", argv[curr_opt]);
     if (EXIT_SUCCESS != execvp(argv[curr_opt], &argv[curr_opt]))
     {
       perror("faketime: Running specified command failed");
+      _exit(EXIT_FAILURE);
+    }
+  }
+  else if (child_pid > 0)
+  {
+    int status;
+    pid_t waited;
+    char buf;
+    close(keepalive_fds[1]); /* only children need keep this open */
+    waited = wait_for_child(child_pid, &status);
+    if (waited == -1)
+    {
+      perror("faketime: waitpid");
+      close(keepalive_fds[0]);
+      cleanup_shobjs();
       exit(EXIT_FAILURE);
     }
+    ssize_t bytes_read;
+    do
+    {
+      bytes_read = read(keepalive_fds[0], &buf, 1);
+    }
+    while (bytes_read == -1 && errno == EINTR);
+    close(keepalive_fds[0]);
+    if (bytes_read == -1)
+    {
+      perror("faketime: read");
+      cleanup_shobjs();
+      exit(EXIT_FAILURE);
+    }
+    cleanup_shobjs();
+    if (WIFSIGNALED(status))
+    {
+      fprintf(stderr, "Caught %s\n", strsignal(WTERMSIG(status)));
+      exit(EXIT_FAILURE);
+    }
+    if (!WIFEXITED(status))
+      exit(EXIT_FAILURE);
+    exit(WEXITSTATUS(status));
   }
   else
   {
-    int ret;
-    char buf;
-    close(keepalive_fds[1]); /* only children need keep this open */
-    waitpid(child_pid, &ret, 0);
-    (void) (read(keepalive_fds[0], &buf, 1) + 1); /* reads 0B when all children exit */
+    perror("faketime: fork");
+    close(keepalive_fds[0]);
+    close(keepalive_fds[1]);
     cleanup_shobjs();
-    if (WIFSIGNALED(ret))
-    {
-      fprintf(stderr, "Caught %s\n", strsignal(WTERMSIG(ret)));
-      exit(EXIT_FAILURE);
-    }
-    exit(WEXITSTATUS(ret));
+    exit(EXIT_FAILURE);
   }
 
   return EXIT_SUCCESS;

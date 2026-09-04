@@ -22,6 +22,7 @@
 #ifndef FAKETIME_COMMON_H
 #define FAKETIME_COMMON_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct system_time_s
@@ -46,8 +47,15 @@ struct ft_shared_time_s
 };
 
 /* Data shared among faketime-spawned processes */
+#define FT_SHARED_MAGIC 0x46544c42U
+#define FT_SHARED_VERSION 1U
+
 struct ft_shared_s
 {
+  /* Validate the mapping before using the process-shared state. */
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
   /*
    * When advancing time linearly with each time(), etc. call, the calls are
    * counted here */
@@ -62,6 +70,28 @@ struct ft_shared_s
   struct ft_shared_time_s start_time_boot;
 #endif
 };
+
+static inline bool ft_shared_time_valid(const struct ft_shared_time_s *time)
+{
+  /* -1 is the intentional, pre-initialization sentinel. */
+  return time != NULL &&
+    (time->nsec == -1 || (time->nsec >= 0 && time->nsec < 1000000000LL));
+}
+
+static inline bool ft_shared_header_valid(const struct ft_shared_s *shared)
+{
+  return shared != NULL &&
+    shared->magic == FT_SHARED_MAGIC &&
+    shared->version == FT_SHARED_VERSION &&
+    shared->size == sizeof(struct ft_shared_s) &&
+    ft_shared_time_valid(&shared->start_time_real) &&
+    ft_shared_time_valid(&shared->start_time_mon) &&
+    ft_shared_time_valid(&shared->start_time_mon_raw)
+#ifdef CLOCK_BOOTTIME
+    && ft_shared_time_valid(&shared->start_time_boot)
+#endif
+    ;
+}
 
 /* These are all needed in order to properly build on OSX */
 #ifdef __APPLE__

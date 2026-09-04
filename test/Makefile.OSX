@@ -1,11 +1,20 @@
 CC ?= clang
 
-CFLAGS += -std=gnu99 -Wall -DFAKE_STAT $(FAKETIME_COMPILE_CFLAGS)
+CFLAGS += -std=gnu99 -Wall -Wextra -DFAKE_STAT $(FAKETIME_COMPILE_CFLAGS)
+TEST_DEMO ?= 1
 
 SRC = timetest.c
 OBJ = ${SRC:.c=.o}
 
-all: timetest test
+ifneq ($(filter -DFAKE_FILE_TIMESTAMPS -DFAKE_UTIME,${CFLAGS}),)
+FILE_TIMESTAMP_TEST_DEP = file_timestamp_test
+endif
+
+ifneq ($(filter -DFAKE_PID,${CFLAGS}),)
+FAKE_PID_TEST_DEP = fake_pid_contract_test
+endif
+
+all: timetest abi_info_test shm_layout_test set_mtime time_ops_test clock_consistency_test macos_clock_test wait_contract_test wait_api_contract_test sem_contract_test wait_timeout_contract_test fd_leak_test fd_liveness_test emfile_clock_test timezone_contract_test init_reentry.dylib ${FILE_TIMESTAMP_TEST_DEP} ${FAKE_PID_TEST_DEP} test
 
 .c.o:
 	${CC} -c ${CFLAGS} $<
@@ -13,16 +22,69 @@ all: timetest test
 timetest: ${OBJ}
 	${CC} -o $@ ${OBJ} ${LDFLAGS}
 
-test: timetest functest
+abi_info_test: abi_info_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+shm_layout_test: shm_layout_test.c ../src/faketime_common.h
+	${CC} -o $@ ${CFLAGS} $<
+
+set_mtime: set_mtime.c
+	${CC} -o $@ ${CFLAGS} $<
+
+time_ops_test: time_ops_test.c ../src/time_ops.h
+	${CC} -o $@ ${CFLAGS} $<
+
+clock_consistency_test: clock_consistency_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+wait_contract_test: wait_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+wait_api_contract_test: wait_api_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+sem_contract_test: sem_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+wait_timeout_contract_test: wait_timeout_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+fd_leak_test: fd_leak_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+fd_liveness_test: fd_liveness_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+emfile_clock_test: emfile_clock_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+timezone_contract_test: timezone_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+init_reentry.dylib: init_reentry.c
+	${CC} -dynamiclib -fPIC -o $@ ${CFLAGS} $<
+
+file_timestamp_test: file_timestamp_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+fake_pid_contract_test: fake_pid_contract_test.c
+	${CC} -o $@ ${CFLAGS} $<
+
+macos_clock_test: macos_clock_test.c
+	${CC} -o $@ ${CFLAGS} $< ../src/libfaketime.1.dylib
+
+test: timetest abi_info_test shm_layout_test time_ops_test clock_consistency_test set_mtime macos_clock_test wait_contract_test wait_api_contract_test sem_contract_test wait_timeout_contract_test fd_leak_test fd_liveness_test emfile_clock_test timezone_contract_test init_reentry.dylib ${RANDOM_TEST_DEP} ${FILE_TIMESTAMP_TEST_DEP} ${FAKE_PID_TEST_DEP} functest
 	@echo
-	@./test_OSX.sh
+	@./abi_info_test
+	@./time_ops_test
+	@if [ "$(TEST_DEMO)" != 0 ]; then ./test_OSX.sh; fi
 
 # run functional tests
 functest:
 	./testframe.sh functests
 
 clean:
-	@rm -f ${OBJ} timetest
+	@rm -f ${OBJ} timetest abi_info_test shm_layout_test set_mtime time_ops_test clock_consistency_test macos_clock_test wait_contract_test wait_api_contract_test sem_contract_test wait_timeout_contract_test fd_leak_test fd_liveness_test emfile_clock_test timezone_contract_test init_reentry.dylib file_timestamp_test fake_pid_contract_test
 
 distclean: clean
 	@echo

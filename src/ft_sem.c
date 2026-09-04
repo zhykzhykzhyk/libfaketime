@@ -1,5 +1,5 @@
 /*
- *  This file is part of libfaketime, version 0.9.12
+ *  This file is part of libfaketime, version 0.9.13
  *
  *  libfaketime is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License v2 as published by the
@@ -77,6 +77,9 @@ static int ft_sem_name_to_path(const char *name, char *path, size_t pathlen)
 #ifdef __ANDROID__
   tmpdir = getenv("TMPDIR");
   if (tmpdir == NULL) tmpdir = "/data/local/tmp";
+#elif defined(__APPLE__)
+  tmpdir = getenv("TMPDIR");
+  if (tmpdir == NULL) tmpdir = "/tmp";
 #else
   tmpdir = "/dev/shm";
 #endif

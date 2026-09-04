@@ -14,11 +14,12 @@
 #         - Intercept clock_settime(), settimeofday(), and adjtime()
 #
 #     FAKE_PID
-#         - Enable faked values for getpid() calls through FAKETIME_FAKEPID
+#         - Not supported on macOS. FAKETIME_FAKEPID can destabilize the
+#           Darwin runtime; see README.
 #
 #     FAKE_RANDOM
-#         - Intercept getentropy(). Dangerous for production use.
-#           See README about FAKE_RANDOM.
+#         - Not supported on macOS. The Darwin getentropy() interposition
+#           path is unsafe; see README about FAKE_RANDOM.
 #
 #     FAKE_STAT
 #         - Enables time faking also for files' timestamps.
@@ -56,7 +57,7 @@ INSTALL ?= install
 PREFIX ?= /usr/local
 
 CFLAGS += -DFAKE_SLEEP -DFAKE_INTERNAL_CALLS -DPREFIX='"'${PREFIX}'"' $(FAKETIME_COMPILE_CFLAGS) -DMACOS_DYLD_INTERPOSE -DFAKE_SETTIME
-LIB_LDFLAGS += -dynamiclib -current_version 0.9.12 -compatibility_version 0.7
+LIB_LDFLAGS += -dynamiclib -current_version 0.9.13 -compatibility_version 0.7
 
 # From macOS 13 onwards, system binaries are compiled against the new arm64e ABI on Apple Silicon.
 # These arm64e binaries enforce Pointer Authentication Code (PAC), and will refuse to run with
@@ -78,21 +79,21 @@ BINS = faketime
 all: ${LIBS} ${BINS}
 
 ifeq ($(ARCH),arm64)
-libfaketime.${SONAME}.dylib: libfaketime.c
-	${CC} -o libfaketime.arm64e.dylib ${CFLAGS} -arch arm64e -fptrauth-calls -fptrauth-returns ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ $<
-	${CC} -o libfaketime.arm64.dylib ${CFLAGS} -arch arm64 ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ $<
+libfaketime.${SONAME}.dylib: libfaketime.c ft_sem.c
+	${CC} -o libfaketime.arm64e.dylib ${CFLAGS} -arch arm64e -fptrauth-calls -fptrauth-returns ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ libfaketime.c ft_sem.c
+	${CC} -o libfaketime.arm64.dylib ${CFLAGS} -arch arm64 ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ libfaketime.c ft_sem.c
 	lipo -create -output $@ libfaketime.arm64e.dylib libfaketime.arm64.dylib
 	rm libfaketime.arm64e.dylib libfaketime.arm64.dylib
 
-faketime: faketime.c
-	${CC} -o $@ ${CFLAGS} -arch arm64e -arch arm64 ${LDFLAGS} $<
+faketime: faketime.c ft_sem.c
+	${CC} -o $@ ${CFLAGS} -arch arm64e -arch arm64 ${LDFLAGS} faketime.c ft_sem.c
 
 else
-libfaketime.${SONAME}.dylib: libfaketime.c
-	${CC} -o $@ ${CFLAGS} ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ $<
+libfaketime.${SONAME}.dylib: libfaketime.c ft_sem.c
+	${CC} -o $@ ${CFLAGS} ${LDFLAGS} ${LIB_LDFLAGS} -install_name ${PREFIX}/lib/faketime/$@ libfaketime.c ft_sem.c
 
-faketime: faketime.c
-	${CC} -o $@ ${CFLAGS} ${LDFLAGS} $<
+faketime: faketime.c ft_sem.c
+	${CC} -o $@ ${CFLAGS} ${LDFLAGS} faketime.c ft_sem.c
 endif
 
 clean:

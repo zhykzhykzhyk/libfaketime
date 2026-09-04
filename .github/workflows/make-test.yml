@@ -1,6 +1,8 @@
 name: Run make test
 
 on:
+  workflow_dispatch:
+  pull_request:
   push:
     branches:
       - master
@@ -11,13 +13,313 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
+        include:
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: ""
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: clang
+          compile_flags: "-DFORCE_MONOTONIC_FIX"
+          sanitizer: false
+        - os: macos-14
+          compiler: clang
+          compile_flags: ""
+          sanitizer: false
+        - os: macos-14
+          compiler: clang
+          compile_flags: "-DFAKE_FILE_TIMESTAMPS"
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: "-DFAKE_FILE_TIMESTAMPS"
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: "-DFAKE_PID"
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: "-DFAKE_RANDOM"
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: "-DINTERCEPT_SYSCALL -DINTERCEPT_FUTEX"
+          sanitizer: false
+        - os: ubuntu-latest
+          compiler: gcc
+          compile_flags: ""
+          sanitizer: true
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CC: ${{ matrix.compiler }}
+      FAKETIME_COMPILE_CFLAGS: ${{ matrix.compile_flags }}
 
     steps:
-    - uses: actions/checkout@v1
-    - name: make
-      run: FAKETIME_COMPILE_CFLAGS="-DFORCE_MONOTONIC_FIX" make
-    - name: make test
-      run: make test
+    - uses: actions/checkout@v4
+    - name: Run release hygiene checks
+      run: ./test/release_check.sh
+    - name: Validate test harness syntax
+      run: ./test/ci_validate.sh
+    - name: Compile ABI variants
+      if: ${{ !matrix.sanitizer }}
+      working-directory: test
+      run: ./compile_abi_variants.sh
+    - name: clean build and bounded test
+      if: ${{ !matrix.sanitizer }}
+      run: |
+        set -o pipefail
+        ./test/clean_build.sh 2>&1 | tee make-test.log
+    - name: Upload build test log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.compile_flags || 'default' }}-log
+        path: make-test.log
+    - name: make test with sanitizers
+      if: ${{ matrix.sanitizer }}
+      env:
+        ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:verify_asan_link_order=0
+        CC: ${{ matrix.compiler }}
+        FAKETIME_COMPILE_CFLAGS: ${{ matrix.compile_flags }}
+        CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+        LDFLAGS: -fsanitize=address,undefined
+      run: |
+        ASAN_LIB=$(gcc -print-file-name=libasan.so.8)
+        set -o pipefail
+        FAKETIME_SANITIZER_LIB="$ASAN_LIB:../src/libfaketime.so.1" make test 2>&1 | tee make-test.log
+    - name: Upload sanitizer test log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.os }}-${{ matrix.compiler }}-sanitizer-log
+        path: make-test.log
+
+  musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Alpine baseline image
+      run: docker pull alpine:3.20
+    - name: make test on Alpine musl
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh alpine:3.20 2>&1 | tee alpine-baseline.log
+    - name: Upload Alpine baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: alpine-baseline-log
+        path: alpine-baseline.log
+
+  snippets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build project
+      env:
+        FAKETIME_COMPILE_CFLAGS: "-DFAKE_PID -DFAKE_RANDOM"
+      run: make
+    - name: Compile and run documented snippet checks
+      env:
+        FAKETIME_COMPILE_CFLAGS: "-DFAKE_PID -DFAKE_RANDOM"
+      run: |
+        make -C test snippets
+
+  debian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Debian 13 baseline image
+      run: docker pull debian:13
+    - name: make test on Debian 13
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh debian:13 2>&1 | tee debian-baseline.log
+    - name: Upload Debian baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: debian-baseline-log
+        path: debian-baseline.log
+
+  debian-legacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Debian 11 baseline image
+      run: docker pull debian:11
+    - name: make test on legacy Debian
+      env:
+        FAKETIME_COMPILE_CFLAGS: "-DFORCE_MONOTONIC_FIX"
+        CFLAGS: "-DFORCE_MONOTONIC_FIX"
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh debian:11 2>&1 | tee debian-legacy-baseline.log
+    - name: Upload legacy Debian baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: debian-legacy-baseline-log
+        path: debian-legacy-baseline.log
+
+  fedora:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Fedora baseline image
+      run: docker pull fedora:latest
+    - name: make test on Fedora
+      env:
+        DOCKER_PLATFORM: linux/amd64
+        FAKETIME_TEST_PHASE_TIMEOUT: 120
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh fedora:latest 2>&1 | tee fedora-baseline.log
+    - name: Upload Fedora baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: fedora-baseline-log
+        path: fedora-baseline.log
+
+  rocky:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Rocky Linux baseline image
+      run: docker pull rockylinux:9
+    - name: make test on Rocky Linux
+      env:
+        DOCKER_PLATFORM: linux/amd64
+        FAKETIME_TEST_PHASE_TIMEOUT: 120
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh rockylinux:9 2>&1 | tee rocky-baseline.log
+    - name: Upload Rocky Linux baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: rocky-baseline-log
+        path: rocky-baseline.log
+
+  centos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull CentOS Stream baseline image
+      run: docker pull quay.io/centos/centos:stream9
+    - name: make test on CentOS Stream
+      env:
+        DOCKER_PLATFORM: linux/amd64
+        FAKETIME_TEST_PHASE_TIMEOUT: 120
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh quay.io/centos/centos:stream9 2>&1 | tee centos-baseline.log
+    - name: Upload CentOS baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: centos-baseline-log
+        path: centos-baseline.log
+
+  opensuse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull openSUSE Tumbleweed baseline image
+      run: docker pull opensuse/tumbleweed:latest
+    - name: make test on openSUSE Tumbleweed
+      env:
+        DOCKER_PLATFORM: linux/amd64
+        FAKETIME_TEST_PHASE_TIMEOUT: 120
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh opensuse/tumbleweed:latest 2>&1 | tee opensuse-baseline.log
+    - name: Upload openSUSE baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: opensuse-baseline-log
+        path: opensuse-baseline.log
+
+  archlinux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Arch Linux baseline image
+      run: docker pull archlinux:base-devel
+    - name: make test on native Arch Linux
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh archlinux:base-devel 2>&1 | tee archlinux-baseline.log
+    - name: Upload Arch Linux baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: archlinux-baseline-log
+        path: archlinux-baseline.log
+
+  linux-architectures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: i386
+          platform: linux/386
+        - name: arm64
+          platform: linux/arm64
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up QEMU for non-native containers
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+    - name: Pull Debian baseline image
+      run: docker pull --platform "${{ matrix.platform }}" debian:13
+    - name: make test on ${{ matrix.name }} Debian
+      env:
+        DOCKER_PLATFORM: ${{ matrix.platform }}
+      run: |
+        set -o pipefail
+        test/docker_baseline.sh debian:13 2>&1 | tee "debian-${{ matrix.name }}-baseline.log"
+    - name: Upload ${{ matrix.name }} baseline log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: debian-${{ matrix.name }}-baseline-log
+        path: debian-${{ matrix.name }}-baseline.log
+
+  fedora-sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@v4
+    - name: Pull Fedora sanitizer image
+      run: docker pull fedora:latest
+    - name: Run Fedora sanitizers
+      env:
+        DOCKER_PLATFORM: linux/amd64
+      run: |
+        set -o pipefail
+        test/docker_sanitizers.sh fedora:latest 2>&1 | tee fedora-sanitizers.log
+    - name: Upload Fedora sanitizer log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: fedora-sanitizers-log
+        path: fedora-sanitizers.log

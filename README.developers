@@ -71,11 +71,18 @@ DEVELOPMENT, BUILDING, AND TESTING
 - Add tests for new features. Extend test/timetest.c appropriately and
   try to use the functional testing framework wherever possible.
 
+- Keep optional runtime probes informational unless the runtime's loader and
+  clock implementation are known to use the interposed libc functions.
+
 - Compiler and linker warnings are treated as errors and not acceptable.
 
 - If you cannot test the code on both Linux and macOS yourself, please
   let us know and consider wrapping your code in #ifdef / #ifndef __APPLE__
   statements.
+
+- Keep platform probes and ABI-specific code paths explicit. In particular,
+  test glibc time32/time64, musl, and macOS independently; do not infer libc
+  support from an empty preprocessor translation unit.
 
 
 DOCUMENTATION
